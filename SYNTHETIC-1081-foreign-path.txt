@@ -1,0 +1,1 @@
+SYNTHETIC-1081 seam 3: foreign path, must be refused.
