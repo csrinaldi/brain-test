@@ -1,0 +1,85 @@
+#!/usr/bin/env sh
+# pre-commit — block direct commits to main/master + refuse a task branch in the
+# main checkout + refuse a byte-identical .memory/records/ restage + repo:check.
+#
+# Hard checks (locally unambiguous — no false positives):
+#   1. Block direct commit to main or master (PRs only).
+#   2. Refuse a task branch in the MAIN CHECKOUT (issue #788, #782 slice 2).
+#   3. staged-records-check.mjs (issue #701) — refuses a staged
+#      .memory/records/ file whose blob is byte-identical to a copy already
+#      on the upstream trunk. Placed BEFORE repo:check (design.md Decision 6):
+#      it is a fast, targeted refusal on the exact accident this ticket is
+#      about, and it degrades to a silent pass (never a block) when the
+#      upstream base cannot be checked.
+#   4. repo:check — validates references and prohibited patterns.
+#
+# No-node guard: exits 0 if node is not available.
+# Installed via core.hooksPath = brain/scripts/hooks.
+
+command -v node >/dev/null 2>&1 || exit 0
+
+# ── 1. Block direct commits to main/master ──────────────────────────────────
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
+  echo ""
+  echo "✗ pre-commit: direct commits to '$branch' are not allowed."
+  echo "  Create a feature branch and submit a PR."
+  echo "  (bypass: git commit --no-verify)"
+  echo ""
+  exit 1
+fi
+
+# ── 2. Refuse a task branch in the MAIN CHECKOUT (#788, #782 slice 2) ───────
+#
+# `harness-contract.md` calls the isolated worktree load-bearing: "NEVER a
+# branch in the main checkout when parallel work is possible." That rule was
+# canonical, compiled into AGENTS.md, and enforced by nothing — an agent session
+# on 2026-08-27 created five such branches with the rule loaded the whole time.
+#
+# THE MEASUREMENT IS ONE PAIR OF REV-PARSES, and it is exact:
+#   main checkout    --git-dir = .git                      = --git-common-dir
+#   linked worktree  --git-dir = .git/worktrees/<name>    != --git-common-dir
+#
+# IT FIRES ALWAYS, ruled 2026-08-28, not only when linked worktrees exist. The
+# contract's "when parallel work is possible" could be read as exempting a repo
+# with none — but parallel work becomes possible the moment a second agent
+# starts, and a guard that switches itself off is one nobody can reason about.
+#
+# THE CONSEQUENCE, STATED RATHER THAN DISCOVERED: with check 1 above, the main
+# checkout now takes no commits at all — `main` by that check, everything else
+# by this one. That is what the doctrine says the main checkout is for, and it
+# is a lockout rather than a nudge, so it is said here and in the refusal.
+#
+# WHAT IT DOES NOT CLOSE. A hook is per-clone and `core.hooksPath` is local
+# config that `bootstrap.sh:298` sets, so a clone that never bootstraps has no
+# hooks. This makes the wrong thing inconvenient and visible; making it
+# unexpressible is #782's slice 3 — the orchestrator handing a worktree the way
+# `cold-boot.mjs` already does for the cold-review producer.
+git_dir=$(git rev-parse --git-dir 2>/dev/null)
+git_common_dir=$(git rev-parse --git-common-dir 2>/dev/null)
+if [ -n "$git_dir" ] && [ "$git_dir" = "$git_common_dir" ]; then
+  echo ""
+  echo "✗ pre-commit: '$branch' is a task branch and this is the MAIN CHECKOUT."
+  echo "  harness-contract.md: never a branch in the main checkout — while it is"
+  echo "  checked out here, no other agent can work in parallel."
+  echo ""
+  echo "  Start the task in its own worktree instead:"
+  echo "      npm run brain:ticket:start -- <id>"
+  echo ""
+  echo "  (bypass: git commit --no-verify)"
+  echo ""
+  exit 1
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+
+# ── 3. staged-records-check ─────────────────────────────────────────────────
+node "$repo_root/brain/scripts/memory/staged-records-check.mjs"
+staged_records_status=$?
+if [ "$staged_records_status" -ne 0 ]; then
+  exit $staged_records_status
+fi
+
+# ── 4. repo:check ──────────────────────────────────────────────────────────
+node "$repo_root/brain/scripts/check-refs.mjs"
+exit $?
